@@ -32,16 +32,9 @@ enum Backend {
 
 impl FirewallGuard {
     pub fn setup(source_port: &SourcePort) -> Self {
-        let (iptables_spec, nft_spec) = match source_port {
-            SourcePort::Number(p) => (p.to_string(), p.to_string()),
-            SourcePort::Range { min, max } => (format!("{min}:{max}"), format!("{min}-{max}")),
-        };
+        let (iptables_spec, nft_spec) = port_specs(source_port);
 
-        let backend = if command_exists("iptables") {
-            Backend::Iptables
-        } else if command_exists("nft") {
-            Backend::Nft
-        } else {
+        let Some(backend) = detect_backend() else {
             eprintln!(
                 "firewall: neither iptables nor nft found, skipping automatic firewall setup. \
                  Firewall source port yourself or scans will see no replies."
@@ -109,6 +102,40 @@ fn command_exists(bin: &str) -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+fn detect_backend() -> Option<Backend> {
+    if command_exists("iptables") {
+        Some(Backend::Iptables)
+    } else if command_exists("nft") {
+        Some(Backend::Nft)
+    } else {
+        None
+    }
+}
+
+/// Backend-specific port specs: `(iptables, nft)`.
+fn port_specs(source_port: &SourcePort) -> (String, String) {
+    match source_port {
+        SourcePort::Number(p) => (p.to_string(), p.to_string()),
+        SourcePort::Range { min, max } => (format!("{min}:{max}"), format!("{min}-{max}")),
+    }
+}
+
+/// Best-effort removal of the DROP rule, for signal exits where `Drop` never
+/// runs. Never fails: a missing rule or backend just means nothing to do.
+pub fn remove_for_port(source_port: &SourcePort) {
+    let Some(backend) = detect_backend() else {
+        return;
+    };
+    let (iptables_spec, nft_spec) = port_specs(source_port);
+    let spec = match backend {
+        Backend::Iptables => &iptables_spec,
+        Backend::Nft => &nft_spec,
+    };
+    // Only our own rule matches this exact spec; ignore errors (absent rule,
+    // locked tables, already gone).
+    let _ = remove_rule(backend, spec);
 }
 
 /// Returns `Ok(true)` if we inserted the rule, `Ok(false)` if it was already

@@ -6,6 +6,7 @@ pub mod firewall;
 pub mod net;
 pub mod processing;
 pub mod scanner;
+pub mod shutdown;
 pub mod strategies;
 pub mod terminal_colors;
 pub mod tracing;

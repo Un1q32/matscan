@@ -13,6 +13,7 @@ use matscan::{
     database::{Database, migrate_mongo_to_postgres},
     exclude,
     firewall::FirewallGuard,
+    shutdown::{install_handlers, spawn_exit_watcher},
     net::tcp::StatelessTcpWriteHalf,
     processing::{SharedData, process_pings},
     scanner::{
@@ -87,7 +88,10 @@ async fn main() -> eyre::Result<()> {
     let database = Database::connect(&config.postgres_uri).await?;
     // Firewall the source port so our own kernel doesn't RST connections.
     // Held until end of main; removed on clean shutdown (best effort).
+    // Ctrl-C and friends exit immediately via the watcher below instead.
     let _firewall_guard = FirewallGuard::setup(&config.source_port);
+    install_handlers();
+    spawn_exit_watcher(config.source_port);
     let scanner = Scanner::new(&config);
     let mut strategy_picker = StrategyPicker::default();
 
