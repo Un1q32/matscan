@@ -31,6 +31,8 @@ use tracing::info;
 enum StrategyCategory {
     Normal,
     Rescan,
+    // Active fingerprinting was removed; kept so it can be re-enabled.
+    #[allow(dead_code)]
     Fingerprint,
 }
 
@@ -114,7 +116,9 @@ async fn main() -> eyre::Result<()> {
         strategy_categories.push(StrategyCategory::Rescan);
     }
     if config.fingerprinting.enabled {
-        strategy_categories.push(StrategyCategory::Fingerprint);
+        eprintln!(
+            "warning: active fingerprinting was removed from matscan (passive fingerprinting still runs during normal scans); ignoring [fingerprinting].enabled"
+        );
     }
 
     if config.debug.only_scan_addr.is_some() {
@@ -333,6 +337,12 @@ async fn perform_scan(
             strategy_picker,
             0,
         );
+        // Keep loop cadence so all-empty strategies don't hot-loop the DB.
+        let sleep_secs = ctx.config.sleep_secs.unwrap_or(10);
+        if sleep_secs > 0 {
+            println!("sleeping for {sleep_secs} seconds");
+            tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
+        }
         return;
     }
 
