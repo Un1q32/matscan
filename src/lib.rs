@@ -2,6 +2,7 @@ pub mod asns;
 pub mod config;
 pub mod database;
 pub mod exclude;
+pub mod firewall;
 pub mod net;
 pub mod processing;
 pub mod scanner;
