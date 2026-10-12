@@ -320,6 +320,22 @@ async fn perform_scan(
         count_before_exclude - target_count
     );
 
+    // A strategy can yield zero targets (e.g. a rescan tier whose time window
+    // matches nothing). ScanSession can't shuffle an empty set
+    // (PerfectRng::new asserts range != 0), so skip the send entirely.
+    if target_count == 0 {
+        println!("no targets to scan, skipping");
+        let mut shared_process_data = ctx.shared_process_data.lock();
+        process_results(
+            &mut shared_process_data,
+            start_time,
+            strategy,
+            strategy_picker,
+            0,
+        );
+        return;
+    }
+
     // this just spews out syn packets so it doesn't need to know what protocol
     // we're using
     let session = ScanSession::new(ranges);
@@ -425,7 +441,11 @@ fn process_results(
         );
         strategy_picker.update_strategy(strategy, score);
     } else {
-        let percent_replied = (results as f64 / packets_sent as f64) * 100.0;
+        let percent_replied = if packets_sent == 0 {
+            0.0
+        } else {
+            (results as f64 / packets_sent as f64) * 100.0
+        };
         println!(
             "ok finished rescanning after {BOLD}{elapsed_secs}{RESET} seconds ({YELLOW}updated {BOLD}{results}{RESET}{YELLOW}/{packets_sent}{RESET}, {GREEN}revived {BOLD}{revived}{RESET}, {BOLD}{percent_replied:.2}%{RESET} replied)",
         );
