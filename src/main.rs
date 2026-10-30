@@ -85,7 +85,7 @@ async fn main() -> eyre::Result<()> {
         config.target.protocol_version,
     );
 
-    let database = Database::connect(&config.postgres_uri).await?;
+    let database = Database::connect(&config.db_path).await?;
     // Firewall the source port so our own kernel doesn't RST connections.
     // Held until end of main; removed on clean shutdown (best effort).
     // Ctrl-C and friends exit immediately via the watcher below instead.

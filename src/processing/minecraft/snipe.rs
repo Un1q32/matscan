@@ -2,14 +2,21 @@ use std::{collections::HashMap, net::SocketAddrV4, sync::Arc};
 
 use parking_lot::Mutex;
 
-use crate::{config::Config, database::{Database, PgU16, PgU32}, processing::{SharedData, minecraft::{ANONYMOUS_PLAYER_NAME, PingResponse, }}};
+use crate::{
+    config::Config,
+    database::Database,
+    processing::{
+        SharedData,
+        minecraft::{ANONYMOUS_PLAYER_NAME, PingResponse},
+    },
+};
 
 pub fn maybe_log_sniped(
     shared: &Arc<Mutex<SharedData>>,
     config: &Config,
     target: SocketAddrV4,
     db: &Database,
-    ping_res: &PingResponse
+    ping_res: &PingResponse,
 ) {
     let mut previous_player_usernames = Vec::new();
     {
@@ -74,14 +81,11 @@ pub fn maybe_log_sniped(
             .iter()
             .all(|p| p == ANONYMOUS_PLAYER_NAME);
 
-        // there's some servers that have a bunch of bots that leave and join, and
-        // they're shown as anonymous players in the sample
+        // there's some servers that have a bunch of bots that leave and join,
+        // and they're shown as anonymous players in the sample
         let too_many_anon_players = current_anon_players_count >= 8 && every_online_player_is_anon;
 
-        if meets_new_anon_player_req
-            && online_players < 25
-            && !too_many_anon_players
-        {
+        if meets_new_anon_player_req && online_players < 25 && !too_many_anon_players {
             tokio::task::spawn(send_to_webhook(
                 config.snipe.webhook_url.clone(),
                 format!("{new_anon_players} anonymous players joined **{target}**"),
@@ -95,11 +99,10 @@ pub fn maybe_log_sniped(
             tokio::task::spawn(async move {
                 // check that there were no anonymous players before
                 if let Ok(has_historical_anon_res) = sqlx::query(
-                            "SELECT FROM server_players WHERE username = '$1' AND server_ip = $2 AND server_port = $3 LIMIT 1",
+                            "SELECT 1 FROM servers, json_each(servers.players_ever) WHERE servers.ip_port = ? AND json_each.value = ? LIMIT 1",
                         )
-                            .bind(ANONYMOUS_PLAYER_NAME)
-                            .bind(PgU32(target.ip().to_bits()))
-                            .bind(PgU16(target.port())).fetch_optional(&database.pool).await {
+                            .bind(format!("{}:{}", target.ip(), target.port()))
+                            .bind(ANONYMOUS_PLAYER_NAME).fetch_optional(&database.pool).await {
                                 let has_historical_anon = has_historical_anon_res.is_some();
                                 if !has_historical_anon {
                                     send_to_webhook(
@@ -107,7 +110,7 @@ pub fn maybe_log_sniped(
                                         format!("anonymous player joined **{target}** for the first time"),
                                     )
                                     .await;
-                                }   
+                                }
                             }
             });
         }
@@ -118,8 +121,6 @@ pub fn maybe_log_sniped(
         .cached_players_for_sniping
         .insert(target, ping_res.player_sample.clone());
 }
-
-
 
 async fn send_to_webhook(webhook_url: String, message: String) {
     let client = reqwest::Client::new();

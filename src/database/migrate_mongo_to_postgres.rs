@@ -1,14 +1,18 @@
 use std::{
     collections::VecDeque,
     net::{Ipv4Addr, SocketAddrV4},
+    str::FromStr,
     time::Instant,
 };
 
 use futures_util::TryStreamExt;
-use sqlx::QueryBuilder;
+use sqlx::{
+    Postgres, QueryBuilder,
+    encode::IsNull,
+    error::BoxDynError,
+    postgres::{PgArgumentBuffer, PgTypeInfo, PgValueFormat, PgValueRef},
+};
 use uuid::Uuid;
-
-use crate::database::{PgU16, PgU32};
 
 pub async fn do_migration(mongodb_uri: &str, postgres_uri: &str) {
     let client_options = mongodb::options::ClientOptions::parse(mongodb_uri)
@@ -408,4 +412,58 @@ struct PingResponseFingerprint {
     pub is_incorrect_field_order: bool,
     pub is_empty_sample: bool,
     pub is_empty_favicon: bool,
+}
+
+pub struct PgU32(pub u32);
+impl FromStr for PgU32 {
+    type Err = std::num::ParseIntError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(s.parse()?))
+    }
+}
+impl sqlx::Type<Postgres> for PgU32 {
+    fn type_info() -> PgTypeInfo {
+        PgTypeInfo::with_name("uint4")
+    }
+}
+impl sqlx::Decode<'_, Postgres> for PgU32 {
+    fn decode(value: PgValueRef<'_>) -> Result<Self, BoxDynError> {
+        Ok(match value.format() {
+            PgValueFormat::Binary => Self(u32::from_be_bytes(value.as_bytes()?.try_into()?)),
+            PgValueFormat::Text => value.as_str()?.parse()?,
+        })
+    }
+}
+impl sqlx::Encode<'_, Postgres> for PgU32 {
+    fn encode_by_ref(&self, buf: &mut PgArgumentBuffer) -> Result<IsNull, BoxDynError> {
+        buf.extend(&self.0.to_be_bytes());
+        Ok(IsNull::No)
+    }
+}
+
+pub struct PgU16(pub u16);
+impl FromStr for PgU16 {
+    type Err = std::num::ParseIntError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(s.parse()?))
+    }
+}
+impl sqlx::Type<Postgres> for PgU16 {
+    fn type_info() -> PgTypeInfo {
+        PgTypeInfo::with_name("uint2")
+    }
+}
+impl sqlx::Decode<'_, Postgres> for PgU16 {
+    fn decode(value: PgValueRef<'_>) -> Result<Self, BoxDynError> {
+        Ok(match value.format() {
+            PgValueFormat::Binary => Self(u16::from_be_bytes(value.as_bytes()?.try_into()?)),
+            PgValueFormat::Text => value.as_str()?.parse()?,
+        })
+    }
+}
+impl sqlx::Encode<'_, Postgres> for PgU16 {
+    fn encode_by_ref(&self, buf: &mut PgArgumentBuffer) -> Result<IsNull, BoxDynError> {
+        buf.extend(&self.0.to_be_bytes());
+        Ok(IsNull::No)
+    }
 }

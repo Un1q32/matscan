@@ -1,33 +1,51 @@
 pub mod collect_servers;
 pub mod migrate_mongo_to_postgres;
 
-use std::{
-    collections::HashSet,
-    fmt::{self, Display},
-    net::Ipv4Addr,
-    ops::Deref,
-    str::FromStr,
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashSet, net::Ipv4Addr, path::Path, sync::Arc, time::Duration};
 
-use futures_util::stream::StreamExt;
 use lru_cache::LruCache;
 use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
 use sqlx::{
-    PgPool, Postgres, Row,
-    encode::IsNull,
-    error::BoxDynError,
-    postgres::{PgArgumentBuffer, PgTypeInfo, PgValueFormat, PgValueRef},
+    Row, SqlitePool,
+    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
 };
 use tracing::{error, info};
 
 use crate::database::collect_servers::CollectServersCache;
 
+/// The schema of the `servers` table matches minecraft-server-scanner's
+/// `servers.db`, so both programs can write to the same database.
+const CREATE_SERVERS_TABLE: &str = "
+    CREATE TABLE IF NOT EXISTS servers (
+        ip_port TEXT PRIMARY KEY,
+        host TEXT DEFAULT '',
+        port INTEGER DEFAULT 25565,
+        motd TEXT DEFAULT '',
+        players_online INTEGER DEFAULT 0,
+        max_players INTEGER DEFAULT 0,
+        version TEXT DEFAULT '',
+        protocol INTEGER,
+        cracked TEXT DEFAULT '',
+        whitelist TEXT DEFAULT '',
+        first_seen REAL DEFAULT 0,
+        last_seen REAL DEFAULT 0,
+        times_seen INTEGER DEFAULT 1,
+        last_source TEXT DEFAULT '',
+        needs_sync INTEGER DEFAULT 1,
+        players_now TEXT DEFAULT '[]',
+        players_ever TEXT DEFAULT '[]'
+    )
+";
+
 #[derive(Clone)]
 pub struct Database {
-    pub pool: PgPool,
+    /// Used for reads. WAL mode lets these run concurrently with writes.
+    pub pool: SqlitePool,
+    /// Used for writes. Having a single connection serializes our own writers
+    /// and avoids most `SQLITE_BUSY` errors. Other processes (like
+    /// minecraft-server-scanner) are handled by the busy timeout.
+    pub write_pool: SqlitePool,
     pub shared: Arc<Mutex<DatabaseSharedData>>,
 }
 
@@ -53,15 +71,40 @@ pub struct CachedIpHash {
 }
 
 impl Database {
-    pub async fn connect(postgres_uri: &str) -> eyre::Result<Self> {
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(100)
-            .connect(postgres_uri)
+    pub async fn connect(db_path: impl AsRef<Path>) -> eyre::Result<Self> {
+        let db_path = db_path.as_ref();
+
+        // Create the parent directory if it doesn't exist so a bad path gives a
+        // clear error instead of SQLite failing to open the file.
+        if let Some(parent) = db_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let options = || {
+            SqliteConnectOptions::new()
+                .filename(db_path)
+                .create_if_missing(true)
+                .journal_mode(SqliteJournalMode::Wal)
+                .synchronous(SqliteSynchronous::Normal)
+                .busy_timeout(Duration::from_secs(30))
+        };
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(8)
+            .connect_with(options())
             .await?;
-        sqlx::migrate!().run(&pool).await?;
+        let write_pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options())
+            .await?;
+
+        init_schema(&write_pool).await?;
 
         let db = Self {
             pool,
+            write_pool,
             shared: Arc::new(Mutex::new(DatabaseSharedData {
                 // arbitrary capacity (2^20)
                 ip_to_hash_and_ports: LruCache::new(1_048_576),
@@ -76,10 +119,7 @@ impl Database {
         let db_clone = db.clone();
         tokio::spawn(async move {
             loop {
-                if let Err(e) = db_clone.delete_spam_historical_players().await {
-                    error!("got error from delete_spam_historical_players: {e}");
-                    // every 4 hours
-                }
+                // every 4 hours
                 tokio::time::sleep(Duration::from_secs(60 * 60 * 4)).await;
                 if let Err(e) = db_clone.update_ips_with_aliased_servers().await {
                     error!("got error from update_ips_with_aliased_servers: {e}");
@@ -92,12 +132,14 @@ impl Database {
 
     async fn update_ips_with_aliased_servers(&self) -> eyre::Result<()> {
         let mut aliased_ips_to_allowed_port = FxHashMap::default();
-        let rows = sqlx::query("SELECT ip, allowed_port FROM ips_with_aliased_servers")
+        let rows = sqlx::query("SELECT ip, allowed_port FROM matscan_aliased_servers")
             .fetch_all(&self.pool)
             .await?;
         for row in rows {
-            let ip = Ipv4Addr::from_bits(row.get::<PgU32, _>(0).0);
-            let allowed_port = row.get::<PgU16, _>(1).0;
+            let Ok(ip) = row.get::<String, _>(0).parse::<Ipv4Addr>() else {
+                continue;
+            };
+            let allowed_port = row.get::<i64, _>(1) as u16;
             aliased_ips_to_allowed_port.insert(ip, allowed_port);
         }
         self.shared.lock().aliased_ips_to_allowed_port = aliased_ips_to_allowed_port;
@@ -115,17 +157,25 @@ impl Database {
             .aliased_ips_to_allowed_port
             .insert(ip, allowed_port);
 
-        let mut txn = self.pool.begin().await?;
+        let ip_string = ip.to_string();
 
-        sqlx::query("INSERT INTO ips_with_aliased_servers (ip, allowed_port) VALUES ($1, $2)")
-            .bind(PgU32(ip.to_bits()))
-            .bind(PgU16(allowed_port))
-            .execute(&mut *txn)
-            .await?;
+        let mut txn = self.write_pool.begin().await?;
+
+        sqlx::query(
+            "
+            INSERT INTO matscan_aliased_servers (ip, allowed_port)
+            VALUES (?, ?)
+            ON CONFLICT (ip) DO UPDATE SET allowed_port = excluded.allowed_port
+            ",
+        )
+        .bind(&ip_string)
+        .bind(allowed_port as i64)
+        .execute(&mut *txn)
+        .await?;
         // delete all servers with this ip that aren't on the allowed port
-        let delete_res = sqlx::query("DELETE FROM servers WHERE ip = $1 AND port != $2")
-            .bind(PgU32(ip.to_bits()))
-            .bind(PgU16(allowed_port))
+        let delete_res = sqlx::query("DELETE FROM servers WHERE host = ? AND port != ?")
+            .bind(&ip_string)
+            .bind(allowed_port as i64)
             .execute(&mut *txn)
             .await?;
         let deleted_count = delete_res.rows_affected();
@@ -136,133 +186,45 @@ impl Database {
 
         Ok(())
     }
-
-    /// Only keep recent historical players from servers that have too many of
-    /// them.
-    ///
-    /// This exists because some servers randomize the player list in their SLP
-    /// response, and we don't want those to fill up our database unnecessarily.
-    pub async fn delete_spam_historical_players(&self) -> eyre::Result<()> {
-        const ALLOWED_PLAYER_LIMIT: i64 = 1000;
-        const KEEP_PLAYER_COUNT: i64 = 500;
-
-        const _: () = assert!(ALLOWED_PLAYER_LIMIT > KEEP_PLAYER_COUNT);
-
-        let mut rows = sqlx::query(
-            "
-            SELECT DISTINCT ip, player_count FROM (
-                SELECT
-                    ip,
-                    (SELECT count(*) as player_count FROM server_players WHERE server_players.server_ip = servers.ip)
-                FROM servers
-            ) WHERE player_count > $1;
-            ",
-        )
-        .bind(ALLOWED_PLAYER_LIMIT)
-        .fetch(&self.pool);
-
-        while let Some(Ok(row)) = rows.next().await {
-            let ip = row.get::<PgU32, _>(0).0;
-            let player_count = row.get::<i64, _>(1);
-
-            let delete_count = player_count - KEEP_PLAYER_COUNT;
-
-            sqlx::query(
-                "
-                DELETE FROM ONLY server_players WHERE ctid IN (
-                    SELECT ctid
-                    FROM server_players
-                    WHERE server_ip = $1 ORDER BY last_seen LIMIT $2
-                )
-                ",
-            )
-            .bind(PgU32(ip))
-            .bind(delete_count)
-            .execute(&self.pool)
-            .await?;
-        }
-
-        Ok(())
-    }
 }
 
-/// Removes null bytes so we don't get errors in Postgres :(
-pub fn sanitize_text_for_postgres(s: &str) -> String {
+async fn init_schema(pool: &SqlitePool) -> eyre::Result<()> {
+    sqlx::query(CREATE_SERVERS_TABLE).execute(pool).await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_servers_last_seen ON servers (last_seen DESC)")
+        .execute(pool)
+        .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_servers_version ON servers (version)")
+        .execute(pool)
+        .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_servers_first_seen ON servers (first_seen)")
+        .execute(pool)
+        .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_servers_host_port ON servers (host, port)")
+        .execute(pool)
+        .await?;
+
+    // matscan-specific bookkeeping. The other programs ignore this table.
+    sqlx::query(
+        "
+        CREATE TABLE IF NOT EXISTS matscan_aliased_servers (
+            ip TEXT PRIMARY KEY,
+            allowed_port INTEGER NOT NULL
+        )
+        ",
+    )
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+/// Removes null bytes, which SQLite doesn't like in TEXT values.
+pub fn sanitize_text(s: &str) -> String {
     s.replace('\0', "")
 }
 
-pub struct PgU32(pub u32);
-impl Deref for PgU32 {
-    type Target = u32;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-impl Display for PgU32 {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-impl FromStr for PgU32 {
-    type Err = std::num::ParseIntError;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self(s.parse()?))
-    }
-}
-impl sqlx::Type<Postgres> for PgU32 {
-    fn type_info() -> PgTypeInfo {
-        PgTypeInfo::with_name("uint4")
-    }
-}
-impl sqlx::Decode<'_, Postgres> for PgU32 {
-    fn decode(value: PgValueRef<'_>) -> Result<Self, BoxDynError> {
-        Ok(match value.format() {
-            PgValueFormat::Binary => Self(u32::from_be_bytes(value.as_bytes()?.try_into()?)),
-            PgValueFormat::Text => value.as_str()?.parse()?,
-        })
-    }
-}
-impl sqlx::Encode<'_, Postgres> for PgU32 {
-    fn encode_by_ref(&self, buf: &mut PgArgumentBuffer) -> Result<IsNull, BoxDynError> {
-        buf.extend(&self.to_be_bytes());
-        Ok(IsNull::No)
-    }
-}
-
-pub struct PgU16(pub u16);
-impl Deref for PgU16 {
-    type Target = u16;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-impl Display for PgU16 {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-impl FromStr for PgU16 {
-    type Err = std::num::ParseIntError;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self(s.parse()?))
-    }
-}
-impl sqlx::Type<Postgres> for PgU16 {
-    fn type_info() -> PgTypeInfo {
-        PgTypeInfo::with_name("uint2")
-    }
-}
-impl sqlx::Decode<'_, Postgres> for PgU16 {
-    fn decode(value: PgValueRef<'_>) -> Result<Self, BoxDynError> {
-        Ok(match value.format() {
-            PgValueFormat::Binary => Self(u16::from_be_bytes(value.as_bytes()?.try_into()?)),
-            PgValueFormat::Text => value.as_str()?.parse()?,
-        })
-    }
-}
-impl sqlx::Encode<'_, Postgres> for PgU16 {
-    fn encode_by_ref(&self, buf: &mut PgArgumentBuffer) -> Result<IsNull, BoxDynError> {
-        buf.extend(&self.to_be_bytes());
-        Ok(IsNull::No)
-    }
+/// Truncate to at most `max` chars. Server-reported text is untrusted, so we
+/// clamp it to the same limits minecraft-server-scanner uses.
+pub fn truncate_chars(s: &str, max: usize) -> String {
+    s.chars().take(max).collect()
 }

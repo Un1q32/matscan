@@ -3,14 +3,10 @@ use std::net::Ipv4Addr;
 use futures_util::StreamExt;
 use rustc_hash::FxHashSet;
 use serde::Deserialize;
-use sqlx::{Postgres, QueryBuilder, Row};
-use tracing::debug;
+use sqlx::{QueryBuilder, Row, Sqlite};
+use tracing::{debug, warn};
 
-use crate::{
-    config::RescanConfig,
-    database::{Database, PgU16, PgU32},
-    scanner::targets::ScanRange,
-};
+use crate::{config::RescanConfig, database::Database, scanner::targets::ScanRange};
 
 #[derive(Deserialize, Clone, Copy, Debug)]
 #[serde(rename_all = "snake_case")]
@@ -22,23 +18,24 @@ pub enum Sort {
 pub async fn get_ranges(database: &Database, opts: &RescanConfig) -> eyre::Result<Vec<ScanRange>> {
     let mut ranges = FxHashSet::default();
 
-    let mut qb: QueryBuilder<'_, Postgres> = QueryBuilder::new(format!(
-        "
-        SELECT ip, port FROM servers
-        WHERE
-            last_pinged > NOW() - INTERVAL '{} seconds'
-            AND last_pinged < NOW() - INTERVAL '{} seconds'
-        ",
-        opts.last_ping_ago_max_secs as i64, opts.rescan_every_secs as i64
-    ));
+    let now = chrono::Utc::now().timestamp();
+
+    // `last_seen` is a unix timestamp in the shared sqlite database.
+    let mut qb: QueryBuilder<'_, Sqlite> =
+        QueryBuilder::new("SELECT host, port FROM servers WHERE last_seen > ");
+    qb.push_bind((now - opts.last_ping_ago_max_secs as i64) as f64);
+    qb.push(" AND last_seen < ");
+    qb.push_bind((now - opts.rescan_every_secs as i64) as f64);
 
     if !opts.filter_sql.is_empty() {
-        // this could result in sql injection, but the config is considered to be
-        // trusted
+        // this could result in sql injection, but the config is considered to
+        // be trusted
         qb.push(format!(" AND {}", opts.filter_sql));
     }
-    if let Some(players_online_ago_max_secs) = opts.players_online_ago_max_secs {
-        qb.push(format!(" AND last_time_player_online > NOW() - INTERVAL '{players_online_ago_max_secs} seconds'"));
+    if opts.players_online_ago_max_secs.is_some() {
+        // The shared servers.db schema only keeps the most recent sighting, so
+        // we can't tell when a server last had players online.
+        warn!("players_online_ago_max_secs is not supported by the sqlite backend, ignoring it");
     }
 
     let mut aliased_ips_to_allowed_port = database
@@ -54,7 +51,7 @@ pub async fn get_ranges(database: &Database, opts: &RescanConfig) -> eyre::Resul
             qb.push(" ORDER BY random()");
         }
         Sort::Oldest => {
-            qb.push(" ORDER BY last_pinged");
+            qb.push(" ORDER BY last_seen");
         }
     }
     if let Some(limit) = opts.limit {
@@ -68,31 +65,36 @@ pub async fn get_ranges(database: &Database, opts: &RescanConfig) -> eyre::Resul
     let mut servers: usize = 0;
 
     while let Some(Ok(row)) = rows.next().await {
-        let ip = Ipv4Addr::from_bits(row.get::<PgU32, _>(0).0);
-        let port = row.get::<PgU16, _>(1).0;
+        let host = row.get::<String, _>(0);
+        let Ok(ip) = host.parse::<Ipv4Addr>() else {
+            continue;
+        };
+        let port = row.get::<i64, _>(1) as u16;
 
-        // there shouldn't be any aliased servers since we should've deleted them, but
-        // this desync can happen if we're running multiple instances of matscan
+        // there shouldn't be any aliased servers since we should've deleted
+        // them, but this desync can happen if we're running multiple
+        // instances of matscan
         if let Some(&allowed_port) = aliased_ips_to_allowed_port.get(&ip)
             && port != allowed_port
         {
             println!(
                 "We encountered an aliased server while getting servers to rescan. Deleting {ip} from database."
             );
-            sqlx::query("DELETE FROM servers WHERE ip = $1 AND port != $2")
-                .bind(PgU32(ip.to_bits()))
-                .bind(PgU16(allowed_port))
-                .execute(&database.pool)
+            sqlx::query("DELETE FROM servers WHERE host = ? AND port != ?")
+                .bind(ip.to_string())
+                .bind(allowed_port as i64)
+                .execute(&database.write_pool)
                 .await?;
-            // this doesn't actually remove it from the database, it just makes it so we
-            // don't delete twice
+            // this doesn't actually remove it from the database, it just makes
+            // it so we don't delete twice
             aliased_ips_to_allowed_port.remove(&ip);
             continue;
         }
 
         if opts.padded && port == 25565 {
-            // if padding is enabled, scan some extra addresses that aren't specifically
-            // known to have minecraft servers so we're not flooded with responses
+            // if padding is enabled, scan some extra addresses that aren't
+            // specifically known to have minecraft servers so we're
+            // not flooded with responses
             let [a, b, c, _] = ip.octets();
             let c = c & 0b1111_0000;
             ranges.insert(ScanRange {

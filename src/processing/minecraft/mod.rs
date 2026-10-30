@@ -14,14 +14,14 @@ use parking_lot::Mutex;
 use serde::Deserialize;
 use sha2::Digest;
 use simd_json::derived::{ValueObjectAccess, ValueObjectAccessAsArray, ValueObjectAccessAsScalar};
-use sqlx::{Arguments, Postgres, QueryBuilder, postgres::PgArguments};
-use tracing::{error, warn};
+use sqlx::Row;
+use tracing::warn;
 use uuid::Uuid;
 
 use super::{ProcessableProtocol, SharedData};
 use crate::{
     config::Config,
-    database::{CachedIpHash, Database, PgU16, PgU32, sanitize_text_for_postgres},
+    database::{CachedIpHash, Database, sanitize_text, truncate_chars},
     processing::minecraft::{
         passive_fingerprint::{PassiveMinecraftFingerprint, generate_passive_fingerprint},
         snipe::maybe_log_sniped,
@@ -107,7 +107,7 @@ impl ProcessableProtocol for protocols::Minecraft {
 
 pub fn parse_ping_response_json(d: &[u8]) -> eyre::Result<PingResponse> {
     let d = String::from_utf8_lossy(d);
-    let d = sanitize_text_for_postgres(&d);
+    let d = sanitize_text(&d);
     let fingerprint = generate_passive_fingerprint(&d)?;
     let mut d = d.into_bytes();
 
@@ -119,10 +119,10 @@ pub fn parse_ping_response_json(d: &[u8]) -> eyre::Result<PingResponse> {
     };
 
     let description = v.get("description");
-    let description_json = sanitize_text_for_postgres(&simd_json::to_string(&description)?);
+    let description_json = sanitize_text(&simd_json::to_string(&description)?);
     let description_plaintext = description
         .map(|description| {
-            sanitize_text_for_postgres(
+            sanitize_text(
                 &azalea_chat::FormattedText::deserialize(description)
                     .unwrap_or_default()
                     .to_string(),
@@ -131,10 +131,10 @@ pub fn parse_ping_response_json(d: &[u8]) -> eyre::Result<PingResponse> {
         .unwrap_or_default();
 
     let version = v.get("version");
-    let version_name = version.get_str("name").map(sanitize_text_for_postgres);
+    let version_name = version.get_str("name").map(sanitize_text);
     let version_protocol = version.get_i32("protocol");
 
-    let favicon = v.get_str("favicon").map(sanitize_text_for_postgres);
+    let favicon = v.get_str("favicon").map(sanitize_text);
     // filter out bad favicons
     let favicon = favicon.filter(|f| f.starts_with("data:image/png;base64,"));
     let favicon_hash = favicon.as_ref().map(|s| make_favicon_hash(s));
@@ -163,7 +163,7 @@ pub fn parse_ping_response_json(d: &[u8]) -> eyre::Result<PingResponse> {
         .map(|a| {
             a.iter()
                 .filter_map(|v| {
-                    let Some(name) = v.get_str("name").map(sanitize_text_for_postgres) else {
+                    let Some(name) = v.get_str("name").map(sanitize_text) else {
                         // name is required
                         is_fake_sample = true;
                         return None;
@@ -208,14 +208,12 @@ pub fn parse_ping_response_json(d: &[u8]) -> eyre::Result<PingResponse> {
     let forge_data = v.get("forgeData");
     let forgedata_fml_network_version = forge_data.get_i32("fmlNetworkVersion");
     let mod_info = v.get("modinfo");
-    let modinfo_type = mod_info.get_str("type").map(sanitize_text_for_postgres);
+    let modinfo_type = mod_info.get_str("type").map(sanitize_text);
     let is_modded = v.get_bool("isModded");
     let modpack_data = v.get("modpackData");
     let modpackdata_project_id = modpack_data.get_i32("projectID");
-    let modpackdata_name = modpack_data.get_str("name").map(sanitize_text_for_postgres);
-    let modpackdata_version = modpack_data
-        .get_str("version")
-        .map(sanitize_text_for_postgres);
+    let modpackdata_name = modpack_data.get_str("name").map(sanitize_text);
+    let modpackdata_version = modpack_data.get_str("version").map(sanitize_text);
 
     Ok(PingResponse {
         description_json,
@@ -267,13 +265,15 @@ pub async fn insert_server_to_db(
                     previously_checked_ports.insert(target.port());
 
                     if *count >= 100 {
-                        // too many servers with the same hash so add to aliased servers
+                        // too many servers with the same hash so add to aliased
+                        // servers
                         warn!("found a new aliased server: {} :(", target.ip());
                         // we call add_to_ips_with_aliased_servers later
                         is_aliased_server = true;
                     }
                 } else {
-                    // this server has a different hash than the other servers with the same IP
+                    // this server has a different hash than the other servers
+                    // with the same IP
                     data.count = None;
                 }
             }
@@ -304,152 +304,136 @@ pub async fn insert_server_to_db(
         bail!("Aliased server: {target:?}");
     }
 
-    if r.favicon.is_some() {
-        sqlx::query(
-            r#"
-            INSERT INTO favicons (hash, data)
-            VALUES ($1, $2)
-            ON CONFLICT (hash) DO NOTHING
-            "#,
+    let ip_port = format!("{}:{}", target.ip(), target.port());
+    let host = target.ip().to_string();
+    let now = chrono::Utc::now().timestamp() as f64;
+
+    // These limits match minecraft-server-scanner so neither program can bloat
+    // the shared database with a hostile server response.
+    let motd = truncate_chars(&sanitize_text(&r.description_plaintext), 500);
+    let version = truncate_chars(
+        &sanitize_text(r.version_name.as_deref().unwrap_or_default()),
+        100,
+    );
+    let online_players = r.online_players.unwrap_or(0).max(0) as i64;
+    let max_players = r.max_players.unwrap_or(0).max(0) as i64;
+    let protocol = r.version_protocol.map(i64::from);
+
+    // Passive offline-mode detection: offline servers hand out v3 uuids.
+    let cracked = match r.is_online_mode {
+        Some(false) => Some("Yes"),
+        Some(true) => Some("No"),
+        None => None,
+    };
+
+    let sample_names = sorted_unique_names(r.player_sample.iter().map(|p| p.name.as_str()));
+
+    let mut txn = db.write_pool.begin().await?;
+
+    let existing_players_ever = sqlx::query("SELECT players_ever FROM servers WHERE ip_port = ?")
+        .bind(&ip_port)
+        .fetch_optional(&mut *txn)
+        .await?
+        .map(|row| row.get::<String, _>(0))
+        .unwrap_or_else(|| "[]".to_string());
+
+    let players_ever = merge_player_lists(&existing_players_ever, &sample_names);
+
+    let players_now_json = serde_json::to_string(&sample_names)?;
+    let players_ever_json = serde_json::to_string(&players_ever)?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO servers (
+            ip_port, host, port, motd, players_online, max_players, version,
+            protocol, cracked, needs_sync, first_seen, last_seen, times_seen,
+            last_source, players_now, players_ever
         )
-        .bind(r.favicon_hash)
-        .bind(r.favicon.clone())
-        .execute(&db.pool)
-        .await?;
-    }
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, ''), 1, ?, ?, 1, 'matscan', ?, ?)
+        ON CONFLICT (ip_port) DO UPDATE SET
+            host = excluded.host,
+            port = excluded.port,
+            motd = excluded.motd,
+            players_online = excluded.players_online,
+            max_players = excluded.max_players,
+            version = excluded.version,
+            protocol = COALESCE(excluded.protocol, servers.protocol),
+            -- preserve a confirmed cracked verdict from minecraft-server-scanner
+            cracked = CASE
+                WHEN servers.cracked IN ('Yes', 'Yes (cached)') THEN servers.cracked
+                ELSE COALESCE(?, servers.cracked)
+            END,
+            needs_sync = 1,
+            last_seen = excluded.last_seen,
+            times_seen = servers.times_seen + 1,
+            last_source = excluded.last_source,
+            players_now = excluded.players_now,
+            players_ever = excluded.players_ever
+        "#,
+    )
+    .bind(&ip_port)
+    .bind(&host)
+    .bind(target.port() as i64)
+    .bind(&motd)
+    .bind(online_players)
+    .bind(max_players)
+    .bind(&version)
+    .bind(protocol)
+    .bind(cracked)
+    .bind(now)
+    .bind(now)
+    .bind(&players_now_json)
+    .bind(&players_ever_json)
+    .bind(cracked)
+    .execute(&mut *txn)
+    .await?;
 
-    let mut qb = InsertServerQueryBuilder::new();
-    let now = chrono::Utc::now();
-    qb.field("ip", PgU32(target.ip().to_bits()));
-    qb.field("port", PgU16(target.port()));
-    qb.field("last_pinged", now);
-    qb.field("is_online_mode", r.is_online_mode);
-    qb.field("favicon_hash", r.favicon_hash);
-    qb.field("description_json", r.description_json.clone());
-    qb.field("description_plaintext", r.description_plaintext.clone());
-    qb.field("online_players", r.online_players);
-    qb.field("max_players", r.max_players);
-    qb.field("version_name", r.version_name.clone());
-    qb.field("version_protocol", r.version_protocol);
-    qb.field("enforces_secure_chat", r.enforces_secure_chat);
-    qb.field("previews_chat", r.previews_chat);
-
-    qb.field("fingerprint_field_order", r.fingerprint.field_order.clone());
-    qb.field(
-        "fingerprint_is_incorrect_field_order",
-        r.fingerprint.incorrect_order,
-    );
-    qb.field("fingerprint_is_empty_sample", r.fingerprint.empty_sample);
-    qb.field("fingerprint_is_empty_favicon", r.fingerprint.empty_favicon);
-
-    qb.field("prevents_chat_reports", r.prevents_chat_reports);
-    qb.field(
-        "forgedata_fml_network_version",
-        r.forgedata_fml_network_version,
-    );
-    qb.field("modinfo_type", r.modinfo_type.clone());
-    qb.field("is_modded", r.is_modded);
-    qb.field("modpackdata_project_id", r.modpackdata_project_id);
-    qb.field("modpackdata_name", r.modpackdata_name.clone());
-    qb.field("modpackdata_version", r.modpackdata_version.clone());
-    if r.player_sample.is_empty() {
-        qb.field("last_time_no_players_online", now);
-    } else {
-        qb.field("last_time_player_online", now);
-    }
-
-    let mut qb = qb.into_querybuilder();
-    let query = qb.build();
-    query.execute(&db.pool).await?;
-
-    // insert players in bulk
-    if !r.player_sample.is_empty() {
-        let mut query_builder = QueryBuilder::new(
-            "INSERT INTO server_players (server_ip, server_port, uuid, username, online_mode, last_seen) ",
-        );
-        query_builder.push_values(&r.player_sample, |mut b, player| {
-            b.push_bind(PgU32(target.ip().to_bits()))
-                .push_bind(PgU16(target.port()))
-                .push_bind(player.uuid)
-                .push_bind(player.name.clone())
-                .push_bind(match player.uuid.get_version_num() {
-                    3 => Some(false),
-                    4 => Some(true),
-                    _ => None,
-                })
-                .push_bind(chrono::Utc::now());
-        });
-        query_builder.push("ON CONFLICT (server_ip, server_port, uuid) DO UPDATE SET last_seen = EXCLUDED.last_seen, username = EXCLUDED.username");
-        let query = query_builder.build();
-        query.execute(&db.pool).await?;
-    }
+    txn.commit().await?;
 
     Ok(())
 }
 
-/// This exists so we can insert a server into the database while having a
-/// dynamic number of fields, and to reduce code duplication.
-///
-/// It's a little cursed, hopefully it's not too slow.
-struct InsertServerQueryBuilder<'a> {
-    pub qb: QueryBuilder<'a, Postgres>,
-    pub field_names: Vec<String>,
-    pub arguments: PgArguments,
+/// Clean, deduplicate (case-insensitively), sort, and cap a list of player
+/// names. This matches how minecraft-server-scanner stores `players_now`.
+fn sorted_unique_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    const MAX_SAMPLE_NAMES: usize = 100;
+    const PLAYER_NAME_MAX_LEN: usize = 32;
+
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for name in names {
+        let name = truncate_chars(&sanitize_text(name), PLAYER_NAME_MAX_LEN);
+        if name.is_empty() || !seen.insert(name.to_lowercase()) {
+            continue;
+        }
+        out.push(name);
+    }
+    out.sort_by_key(|n| n.to_lowercase());
+    out.truncate(MAX_SAMPLE_NAMES);
+    out
 }
-impl<'a> InsertServerQueryBuilder<'a> {
-    pub fn new() -> Self {
-        Self {
-            qb: QueryBuilder::new("INSERT INTO servers ("),
-            field_names: Vec::new(),
-            arguments: PgArguments::default(),
-        }
-    }
 
-    pub fn field(
-        &mut self,
-        name: &str,
-        value: impl sqlx::Encode<'a, Postgres> + sqlx::Type<sqlx::Postgres> + 'a,
-    ) {
-        if !self.field_names.is_empty() {
-            self.qb.push(", ");
-        }
-        self.field_names.push(name.to_string());
-        self.qb.push(name);
-        if let Err(e) = self.arguments.add(value) {
-            error!("Failed to add argument {name}: {e:?}");
-        };
-    }
+/// Union of the names already in the database and the latest sample. Names
+/// that were already known are kept first so junk names can't evict them.
+fn merge_player_lists(existing_json: &str, new_names: &[String]) -> Vec<String> {
+    const PLAYERS_EVER_MAX: usize = 500;
+    const PLAYER_NAME_MAX_LEN: usize = 32;
 
-    pub fn into_querybuilder(mut self) -> QueryBuilder<'a, Postgres> {
-        self.qb.push(") VALUES (");
-        let mut first = true;
-        for _ in &self.field_names {
-            if first {
-                first = false;
-            } else {
-                self.qb.push(", ");
-            }
-            // the actual argument gets set later when we do with_arguments
-            // i know this is evil
-            self.qb.push_bind(0);
+    let existing: Vec<String> = serde_json::from_str(existing_json).unwrap_or_default();
+
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for name in existing.iter().chain(new_names) {
+        let name = truncate_chars(&sanitize_text(name), PLAYER_NAME_MAX_LEN);
+        if name.is_empty() || !seen.insert(name.to_lowercase()) {
+            continue;
         }
-        self.qb.push(") ON CONFLICT (ip, port) DO UPDATE SET ");
-        let mut first = true;
-        for name in &self.field_names {
-            if name == "ip" || name == "port" {
-                continue;
-            }
-            if first {
-                first = false;
-            } else {
-                self.qb.push(", ");
-            }
-            self.qb.push(name);
-            self.qb.push(" = EXCLUDED.");
-            self.qb.push(name);
+        out.push(name);
+        if out.len() >= PLAYERS_EVER_MAX {
+            break;
         }
-        QueryBuilder::with_arguments(self.qb.into_sql(), self.arguments)
     }
+    out
 }
 
 fn make_ping_response_hash(ping_res: &PingResponse) -> eyre::Result<u64> {

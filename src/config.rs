@@ -7,7 +7,15 @@ use crate::scanner::SourcePort;
 #[derive(Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    pub postgres_uri: String,
+    /// Path to the SQLite database shared with minecraft-server-scanner.
+    ///
+    /// The `servers` table in this database is the same one used by
+    /// minecraft-server-scanner, so results from both programs show up in the
+    /// same place.
+    ///
+    /// Defaults to `servers.db` in the current directory.
+    #[serde(default = "default_db_path")]
+    pub db_path: PathBuf,
     pub rate: u64,
 
     /// The number of seconds to sleep after each scan. You can set this to 0
@@ -69,6 +77,10 @@ pub struct Config {
 
     #[serde(default)]
     pub debug: DebugConfig,
+}
+
+fn default_db_path() -> PathBuf {
+    PathBuf::from("servers.db")
 }
 
 #[derive(Deserialize, Clone)]

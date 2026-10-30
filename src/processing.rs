@@ -4,7 +4,7 @@ pub mod minecraft_fingerprinting;
 use std::{
     collections::{HashMap, VecDeque},
     mem,
-    net::{Ipv4Addr, SocketAddrV4},
+    net::SocketAddrV4,
     sync::Arc,
     time::Duration,
 };
@@ -12,14 +12,11 @@ use std::{
 use chrono::{NaiveDateTime, TimeDelta, Utc};
 use parking_lot::Mutex;
 use rustc_hash::{FxHashMap, FxHashSet};
-use sqlx::{QueryBuilder, Row};
+use sqlx::{QueryBuilder, Row, Sqlite};
 use tokio::time::sleep;
 
 use crate::{
-    config::Config,
-    database::{Database, PgU16, PgU32},
-    processing::minecraft::SamplePlayer,
-    terminal_colors::*,
+    config::Config, database::Database, processing::minecraft::SamplePlayer, terminal_colors::*,
 };
 
 pub struct SharedData {
@@ -153,8 +150,9 @@ async fn handle_response_futures(
         } else {
             let last_pinged = last_pinged_map.get(&addr).copied();
             if let Some(last_pinged) = last_pinged {
-                // if the last_pinged was more than 2 hours ago, then we consider the server to
-                // be Revived instead of Updated
+                // if the last_pinged was more than 2 hours ago, then we
+                // consider the server to be Revived instead of
+                // Updated
                 if now.naive_utc() - last_pinged > TimeDelta::hours(2) {
                     ProcessedServerStatus::Revived
                 } else {
@@ -222,25 +220,29 @@ async fn fetch_last_pinged_for_servers(
     db: &Database,
     servers: &[SocketAddrV4],
 ) -> eyre::Result<FxHashMap<SocketAddrV4, NaiveDateTime>> {
-    // fetch the last_pinged for all servers in this chunk in one big query
-    let mut last_pinged_qb = QueryBuilder::new("SELECT ip, port, last_pinged FROM servers WHERE (");
-    for (i, addr) in servers.iter().enumerate() {
-        if i > 0 {
-            last_pinged_qb.push(") OR (");
-        }
-        last_pinged_qb.push("ip = ");
-        last_pinged_qb.push_bind(PgU32(addr.ip().to_bits()));
-        last_pinged_qb.push(" AND port = ");
-        last_pinged_qb.push_bind(PgU16(addr.port()));
+    // fetch the last_seen for all servers in this chunk in one big query
+    let mut last_pinged_qb: QueryBuilder<'_, Sqlite> =
+        QueryBuilder::new("SELECT host, port, last_seen FROM servers WHERE ip_port IN (");
+    let mut separated = last_pinged_qb.separated(", ");
+    for addr in servers {
+        separated.push_bind(format!("{}:{}", addr.ip(), addr.port()));
     }
-    last_pinged_qb.push(")");
+    separated.push_unseparated(")");
     let last_pinged_rows = last_pinged_qb.build().fetch_all(&db.pool).await?;
     let mut last_pinged_map = FxHashMap::<SocketAddrV4, NaiveDateTime>::default();
     for row in last_pinged_rows {
-        let ip = Ipv4Addr::from_bits(row.get::<PgU32, _>(0).0);
-        let port = row.get::<PgU16, _>(1).0;
-        let last_pinged = row.get::<NaiveDateTime, _>(2);
-        last_pinged_map.insert(SocketAddrV4::new(ip, port), last_pinged);
+        let host = row.get::<String, _>(0);
+        let Ok(ip) = host.parse() else {
+            continue;
+        };
+        let port = row.get::<i64, _>(1) as u16;
+        let last_seen = row.get::<f64, _>(2);
+        let secs = last_seen.trunc() as i64;
+        let nanos = ((last_seen.fract() * 1e9) as u32).min(999_999_999);
+        let Some(last_pinged) = chrono::DateTime::from_timestamp(secs, nanos) else {
+            continue;
+        };
+        last_pinged_map.insert(SocketAddrV4::new(ip, port), last_pinged.naive_utc());
     }
 
     Ok(last_pinged_map)

@@ -9,7 +9,7 @@ use rustc_hash::FxHashMap;
 use sqlx::Row;
 use tracing::info;
 
-use crate::database::{Database, PgU16, PgU32};
+use crate::database::Database;
 
 #[derive(Default)]
 pub struct CollectServersCache {
@@ -65,6 +65,8 @@ impl Database {
     ) -> eyre::Result<Box<[SocketAddrV4]>> {
         info!("Collecting servers with filter {filter:?}");
 
+        let now = chrono::Utc::now().timestamp();
+
         let query = match filter {
             CollectServersFilter::Active30d => {
                 if let Some(cached) = self
@@ -77,9 +79,8 @@ impl Database {
                     return Ok(cached.into());
                 }
 
-                sqlx::query(
-                    "SELECT ip, port FROM servers WHERE last_pinged > NOW() - INTERVAL '30 days'",
-                )
+                sqlx::query("SELECT host, port FROM servers WHERE last_seen > ?")
+                    .bind((now - 60 * 60 * 24 * 30) as f64)
             }
             CollectServersFilter::New => {
                 if let Some(cached) = self
@@ -93,9 +94,8 @@ impl Database {
                 }
 
                 // inserted in the past 7 days
-                sqlx::query(
-                    "SELECT ip, port FROM servers WHERE first_pinged > NOW() - INTERVAL '7 days'",
-                )
+                sqlx::query("SELECT host, port FROM servers WHERE first_seen > ?")
+                    .bind((now - 60 * 60 * 24 * 7) as f64)
             }
             CollectServersFilter::Active365d => {
                 if let Some(cached) = self
@@ -108,9 +108,8 @@ impl Database {
                     return Ok(cached.into());
                 }
 
-                sqlx::query(
-                    "SELECT ip, port FROM servers WHERE last_pinged > NOW() - INTERVAL '365 days'",
-                )
+                sqlx::query("SELECT host, port FROM servers WHERE last_seen > ?")
+                    .bind((now - 60 * 60 * 24 * 365) as f64)
             }
         };
 
@@ -118,8 +117,12 @@ impl Database {
 
         let mut servers = Vec::new();
         while let Some(row) = rows.try_next().await? {
-            let ip = Ipv4Addr::from_bits(row.get::<PgU32, _>(0).0);
-            let port = row.get::<PgU16, _>(1).0;
+            let host = row.get::<String, _>(0);
+            let Ok(ip) = host.parse::<Ipv4Addr>() else {
+                // hostnames can be in the db but matscan only scans ipv4
+                continue;
+            };
+            let port = row.get::<i64, _>(1) as u16;
 
             servers.push(SocketAddrV4::new(ip, port));
 
@@ -143,14 +146,14 @@ impl Database {
                 self.shared
                     .lock()
                     .collect_servers_cache
-                    .servers_30_days
+                    .servers_new
                     .set_servers(servers_cloned);
             }
             CollectServersFilter::Active365d => {
                 self.shared
                     .lock()
                     .collect_servers_cache
-                    .servers_30_days
+                    .servers_365_days
                     .set_servers(servers_cloned);
             }
         };

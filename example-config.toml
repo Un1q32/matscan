@@ -1,6 +1,8 @@
 # see src/config.rs for all options and descriptions
 
-postgres_uri = 'postgres://postgres@localhost/matscan'
+# Path to the SQLite database shared with minecraft-server-scanner.
+# Both programs use the same `servers` table, so results show up in one place.
+db_path = '../minecraft-server-scanner/servers.db'
 
 # packets per second
 rate = 100_000
