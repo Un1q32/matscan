@@ -29,6 +29,14 @@ rescan_every_secs = 3600
 enabled = false
 rescan_every_secs = 600
 limit = 10_000
-[rescan2.filter]
-'minecraft.players.online' = { '$gte' = 1 }
-'minecraft.players.sample' = { '$exists' = true, '$ne' = [] }
+# Raw SQL appended to the rescan query (the config is trusted).
+# Example: only rescan servers that currently report players online.
+# filter_sql = "players_online >= 1 AND players_now != '[]'"
+
+# Periodically sync the shared database with the network DB.
+# URL and token are read from minecraft-server-scanner's netdb.json.
+[sync]
+enabled = true
+netdb_path = '../minecraft-server-scanner/netdb.json'
+# seconds between syncs (default 300)
+sync_every_secs = 300

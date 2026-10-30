@@ -86,6 +86,12 @@ async fn main() -> eyre::Result<()> {
     );
 
     let database = Database::connect(&config.db_path).await?;
+    if config.sync.enabled {
+        database.spawn_periodic_sync(
+            config.sync.netdb_path.clone(),
+            Duration::from_secs(config.sync.sync_every_secs),
+        );
+    }
     // Firewall the source port so our own kernel doesn't RST connections.
     // Held until end of main; removed on clean shutdown (best effort).
     // Ctrl-C and friends exit immediately via the watcher below instead.

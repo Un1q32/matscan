@@ -1,5 +1,6 @@
 pub mod collect_servers;
 pub mod migrate_mongo_to_postgres;
+pub mod sync;
 
 use std::{collections::HashSet, net::Ipv4Addr, path::Path, sync::Arc, time::Duration};
 
@@ -130,6 +131,22 @@ impl Database {
         Ok(db)
     }
 
+    /// Periodically sync this database with the shared network DB described by
+    /// `netdb_path` (the scanner's `netdb.json`).
+    pub fn spawn_periodic_sync(&self, netdb_path: std::path::PathBuf, interval: Duration) {
+        let db = self.clone();
+        tokio::spawn(async move {
+            loop {
+                match sync::sync_once(&db, &netdb_path).await {
+                    Ok(Some(summary)) => sync::log_summary(&summary),
+                    Ok(None) => {}
+                    Err(e) => tracing::warn!("shared-DB sync failed: {e}"),
+                }
+                tokio::time::sleep(interval).await;
+            }
+        });
+    }
+
     async fn update_ips_with_aliased_servers(&self) -> eyre::Result<()> {
         let mut aliased_ips_to_allowed_port = FxHashMap::default();
         let rows = sqlx::query("SELECT ip, allowed_port FROM matscan_aliased_servers")
@@ -227,4 +244,71 @@ pub fn sanitize_text(s: &str) -> String {
 /// clamp it to the same limits minecraft-server-scanner uses.
 pub fn truncate_chars(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
+}
+
+// Player-name tracking, matching minecraft-server-scanner's limits. Lists are
+// stored as JSON arrays in `players_now` and `players_ever`.
+pub const MAX_SAMPLE_NAMES: usize = 100;
+pub const PLAYERS_EVER_MAX: usize = 500;
+pub const PLAYER_NAME_MAX_LEN: usize = 32;
+
+fn clean_player_name(name: &str) -> String {
+    truncate_chars(&sanitize_text(name), PLAYER_NAME_MAX_LEN)
+}
+
+fn clean_unique_names<'a>(names: impl IntoIterator<Item = &'a str>, cap: usize) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for name in names {
+        let name = clean_player_name(name);
+        if name.is_empty() || !seen.insert(name.to_lowercase()) {
+            continue;
+        }
+        out.push(name);
+        if out.len() >= cap {
+            break;
+        }
+    }
+    out.sort_by_key(|n| n.to_lowercase());
+    out
+}
+
+/// Clean, deduplicate (case-insensitively), sort, and cap a list of player
+/// names. This matches how minecraft-server-scanner stores `players_now`.
+pub fn sorted_unique_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    clean_unique_names(names, MAX_SAMPLE_NAMES)
+}
+
+/// Parse a stored JSON player list, cleaning and deduplicating it.
+pub fn decode_player_list(value: &str) -> Vec<String> {
+    let parsed: Vec<String> = serde_json::from_str(value).unwrap_or_default();
+    clean_unique_names(parsed.iter().map(String::as_str), PLAYERS_EVER_MAX)
+}
+
+/// Union of two name lists, capped. Names in `old` are kept first so junk
+/// names can't evict names that are already known.
+pub fn merge_name_lists(old: &[String], new: &[String]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for name in old.iter().chain(new) {
+        let name = clean_player_name(name);
+        if name.is_empty() || !seen.insert(name.to_lowercase()) {
+            continue;
+        }
+        out.push(name);
+        if out.len() >= PLAYERS_EVER_MAX {
+            break;
+        }
+    }
+    out
+}
+
+/// Union of the names already in the database and the latest sample.
+pub fn merge_player_lists(existing_json: &str, new_names: &[String]) -> Vec<String> {
+    let existing = decode_player_list(existing_json);
+    merge_name_lists(&existing, new_names)
+}
+
+pub fn encode_player_list(names: &[String]) -> String {
+    serde_json::to_string(names).unwrap_or_else(|_| "[]".to_string())
 }

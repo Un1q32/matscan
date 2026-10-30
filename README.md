@@ -35,6 +35,12 @@ Set `db_path` in `config.toml` to that database (the example config points at
 `../minecraft-server-scanner/servers.db`). The database and its `servers` table
 are created automatically if they don't exist yet.
 
+matscan can also sync that database with the shared network DB. It reads the
+URL and token from minecraft-server-scanner's `netdb.json`; point
+`sync.netdb_path` at it (or copy the file next to matscan). Syncing runs every
+`sync.sync_every_secs` seconds (default 300) and can be disabled with
+`sync.enabled = false`.
+
 To run matscan, use the following:
 ```sh
 # Firewall port 61000 so your OS doesn't close the connections

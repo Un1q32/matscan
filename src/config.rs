@@ -77,6 +77,50 @@ pub struct Config {
 
     #[serde(default)]
     pub debug: DebugConfig,
+
+    /// Periodically sync this database with the shared network database.
+    #[serde(default)]
+    pub sync: SyncConfig,
+}
+
+#[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct SyncConfig {
+    /// Whether to periodically sync with the shared network DB. Has no effect
+    /// if `netdb_path` has no url/token.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Path to minecraft-server-scanner's `netdb.json`, which contains the
+    /// shared-DB URL and token. matscan does not store credentials itself.
+    #[serde(default = "default_netdb_path")]
+    pub netdb_path: PathBuf,
+
+    /// How often to sync, in seconds. Defaults to 300 (5 minutes).
+    #[serde(default = "default_sync_every_secs")]
+    pub sync_every_secs: u64,
+}
+
+impl Default for SyncConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            netdb_path: default_netdb_path(),
+            sync_every_secs: default_sync_every_secs(),
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_netdb_path() -> PathBuf {
+    PathBuf::from("netdb.json")
+}
+
+fn default_sync_every_secs() -> u64 {
+    300
 }
 
 fn default_db_path() -> PathBuf {

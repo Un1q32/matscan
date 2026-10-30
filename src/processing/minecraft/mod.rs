@@ -21,7 +21,10 @@ use uuid::Uuid;
 use super::{ProcessableProtocol, SharedData};
 use crate::{
     config::Config,
-    database::{CachedIpHash, Database, sanitize_text, truncate_chars},
+    database::{
+        CachedIpHash, Database, merge_player_lists, sanitize_text, sorted_unique_names,
+        truncate_chars,
+    },
     processing::minecraft::{
         passive_fingerprint::{PassiveMinecraftFingerprint, generate_passive_fingerprint},
         snipe::maybe_log_sniped,
@@ -391,49 +394,6 @@ pub async fn insert_server_to_db(
     txn.commit().await?;
 
     Ok(())
-}
-
-/// Clean, deduplicate (case-insensitively), sort, and cap a list of player
-/// names. This matches how minecraft-server-scanner stores `players_now`.
-fn sorted_unique_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<String> {
-    const MAX_SAMPLE_NAMES: usize = 100;
-    const PLAYER_NAME_MAX_LEN: usize = 32;
-
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
-    for name in names {
-        let name = truncate_chars(&sanitize_text(name), PLAYER_NAME_MAX_LEN);
-        if name.is_empty() || !seen.insert(name.to_lowercase()) {
-            continue;
-        }
-        out.push(name);
-    }
-    out.sort_by_key(|n| n.to_lowercase());
-    out.truncate(MAX_SAMPLE_NAMES);
-    out
-}
-
-/// Union of the names already in the database and the latest sample. Names
-/// that were already known are kept first so junk names can't evict them.
-fn merge_player_lists(existing_json: &str, new_names: &[String]) -> Vec<String> {
-    const PLAYERS_EVER_MAX: usize = 500;
-    const PLAYER_NAME_MAX_LEN: usize = 32;
-
-    let existing: Vec<String> = serde_json::from_str(existing_json).unwrap_or_default();
-
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
-    for name in existing.iter().chain(new_names) {
-        let name = truncate_chars(&sanitize_text(name), PLAYER_NAME_MAX_LEN);
-        if name.is_empty() || !seen.insert(name.to_lowercase()) {
-            continue;
-        }
-        out.push(name);
-        if out.len() >= PLAYERS_EVER_MAX {
-            break;
-        }
-    }
-    out
 }
 
 fn make_ping_response_hash(ping_res: &PingResponse) -> eyre::Result<u64> {
